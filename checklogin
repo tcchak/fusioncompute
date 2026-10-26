@@ -2,7 +2,7 @@
 """
 FusionCompute VRM REST API smoke test.
 
-Version: 1.1.0
+Version: 1.2.0
 
 Tests:
   1) Login (POST /service/session) — reports success/failure
@@ -10,8 +10,14 @@ Tests:
   3) List all VMs across sites (GET /service/sites/{id}/vms) with pagination
 
 Based on FusionCompute 8.8.1 VRM APIs (HTTPS, base path /service).
-Default API port: 8443. Auth defaults to domain user. TLS verify off
-(self-signed certificates).
+
+Port note (Huawei VRM APIs doc):
+  - REST northbound API: typically TCP 7443
+  - Web UI login page: typically TCP 8443
+  If login returns HTTP 401 / errorCode 10000002 against :8443, retry with :7443.
+
+Auth defaults to domain user + cascading domain authentication.
+TLS verify is off (self-signed certificates).
 
 Example (interactive prompts for URL, username, password):
   python3 vrm_api_test.py
@@ -30,18 +36,37 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __api_doc__ = "FusionCompute 8.8.1 VRM APIs"
 
 DEFAULT_PORT = 8443
+REST_API_PORT = 7443  # documented VRM REST port
 DEFAULT_API_VERSION = "8.1"
 DEFAULT_USER_TYPE = 1  # domain user
+DEFAULT_AUTH_TYPE = 1  # cascading domain authentication
 PAGE_SIZE = 100
 TOKEN_HEADER = "X-Auth-Token"
+
+USER_TYPE_NAMES = {0: "local", 1: "domain", 2: "interconnection"}
+AUTH_TYPE_NAMES = {0: "local", 1: "cascading-domain"}
+
+# Doc: 401 / 10000002 = not logged in or session timed out
+HINT_10000002 = """
+Hints for HTTP 401 / errorCode 10000002
+("not logged in or login timed out"):
+  1) REST API port is usually 7443, while 8443 is often the Web UI.
+     Try URL like: https://<vrm-ip>:7443
+  2) Domain login needs BOTH:
+       X-Auth-UserType=1  (domain)
+       X-Auth-AuthType=1  (cascading domain authentication)
+  3) Username format: try DOMAIN\\\\user  or  user@domain.com  or  plain sAMAccountName
+  4) Account must exist in FusionCompute with a role assigned (domain sync / mapped).
+  5) Re-run with --diagnose to try common auth combinations.
+""".strip()
 
 
 @dataclass
@@ -50,7 +75,12 @@ class LoginResult:
     token: str | None = None
     body: dict[str, Any] | None = None
     error: str | None = None
+    error_code: str | None = None
     http_status: int | None = None
+    user_type: int | None = None
+    auth_type: int | None = None
+    encrypt_algorithm: int | None = None
+    attempted: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -179,23 +209,33 @@ class VrmClient:
         password: str,
         *,
         user_type: int = DEFAULT_USER_TYPE,
+        auth_type: int = DEFAULT_AUTH_TYPE,
         encrypt_algorithm: int = 0,
+        verbose: bool = False,
     ) -> LoginResult:
         """
         POST /service/session
 
         user_type: 0 local, 1 domain, 2 interconnection.
+        auth_type: 0 local authentication, 1 cascading domain authentication.
         """
         hashed = self.hash_password(password, encrypt_algorithm)
+        extra = {
+            "X-Auth-User": username,
+            "X-Auth-Key": hashed,
+            "X-Auth-UserType": str(user_type),
+            "X-Auth-AuthType": str(auth_type),
+            "X-ENCRYPT-ALGORITHM": str(encrypt_algorithm),
+        }
+        if verbose:
+            safe = {k: ("***" if k == "X-Auth-Key" else v) for k, v in extra.items()}
+            print(f"  POST {self.base}/service/session")
+            print(f"  headers: {safe}")
+
         status, headers, body = self.request(
             "POST",
             "/service/session",
-            headers={
-                "X-Auth-User": username,
-                "X-Auth-Key": hashed,
-                "X-Auth-UserType": str(user_type),
-                "X-ENCRYPT-ALGORITHM": str(encrypt_algorithm),
-            },
+            headers=extra,
             auth=False,
         )
 
@@ -205,6 +245,22 @@ class VrmClient:
                 token = value
                 break
 
+        error_code = None
+        err = None
+        if isinstance(body, dict):
+            error_code = str(body.get("errorCode")) if body.get("errorCode") is not None else None
+            err = body.get("errorDes") or body.get("errorCode") or json.dumps(body)
+        elif body is not None:
+            err = str(body)
+        else:
+            err = f"HTTP {status}"
+
+        label = (
+            f"userType={user_type}/{USER_TYPE_NAMES.get(user_type, '?')} "
+            f"authType={auth_type}/{AUTH_TYPE_NAMES.get(auth_type, '?')} "
+            f"encrypt={encrypt_algorithm}"
+        )
+
         if status == 200 and token:
             self.token = token
             return LoginResult(
@@ -212,19 +268,69 @@ class VrmClient:
                 token=token,
                 body=body if isinstance(body, dict) else None,
                 http_status=status,
+                user_type=user_type,
+                auth_type=auth_type,
+                encrypt_algorithm=encrypt_algorithm,
+                attempted=[label],
             )
 
-        err = None
-        if isinstance(body, dict):
-            err = body.get("errorDes") or body.get("errorCode") or json.dumps(body)
-        else:
-            err = str(body) if body is not None else f"HTTP {status}"
+        if verbose:
+            print(f"  -> HTTP {status} body={body}")
+
         return LoginResult(
             ok=False,
             body=body if isinstance(body, dict) else None,
             error=err,
+            error_code=error_code,
             http_status=status,
+            user_type=user_type,
+            auth_type=auth_type,
+            encrypt_algorithm=encrypt_algorithm,
+            attempted=[label],
         )
+
+    def login_with_fallback(
+        self,
+        username: str,
+        password: str,
+        *,
+        user_type: int,
+        auth_type: int,
+        encrypt_algorithm: int = 0,
+        diagnose: bool = False,
+        verbose: bool = False,
+    ) -> LoginResult:
+        """Try primary auth settings; optionally probe common combinations."""
+        attempts: list[tuple[int, int, int]] = [(user_type, auth_type, encrypt_algorithm)]
+        if diagnose:
+            for ut, at, enc in (
+                (1, 1, 0),  # domain + cascading domain + SHA-256
+                (1, 0, 0),  # domain + local auth type
+                (2, 0, 0),  # interconnection (northbound API user)
+                (0, 0, 0),  # local user
+                (1, 1, 1),  # domain + plaintext password
+            ):
+                if (ut, at, enc) not in attempts:
+                    attempts.append((ut, at, enc))
+
+        attempted_labels: list[str] = []
+        last = LoginResult(ok=False, error="no attempts")
+        for ut, at, enc in attempts:
+            last = self.login(
+                username,
+                password,
+                user_type=ut,
+                auth_type=at,
+                encrypt_algorithm=enc,
+                verbose=verbose,
+            )
+            attempted_labels.extend(last.attempted)
+            if last.ok:
+                last.attempted = attempted_labels
+                return last
+
+        last.attempted = attempted_labels
+        return last
 
     def logout(self) -> bool:
         if not self.token:
@@ -302,20 +408,23 @@ def prompt_credentials(args: argparse.Namespace) -> tuple[VrmEndpoint, str, str]
     """Prompt for VRM URL, domain username, and password when not provided."""
     print(f"FusionCompute VRM API test  v{__version__}")
     print(f"API reference: {__api_doc__}")
-    print(f"Defaults: port {DEFAULT_PORT}, domain user, self-signed TLS accepted")
+    print(
+        f"Defaults: port {DEFAULT_PORT} (REST often {REST_API_PORT}), "
+        "domain user + cascading domain auth, self-signed TLS accepted"
+    )
     print()
 
     raw_url = args.url or os.environ.get("VRM_URL")
     if not raw_url:
         raw_url = _prompt(
-            "VRM URL (e.g. https://vrm.example.com:8443)",
+            f"VRM URL (e.g. https://vrm.example.com:{REST_API_PORT})",
             default=None,
         )
     endpoint = parse_vrm_url(raw_url, default_port=args.port)
 
     username = args.user or os.environ.get("VRM_USER")
     if not username:
-        username = _prompt("Domain username")
+        username = _prompt("Domain username (DOMAIN\\user or user@domain or sAMAccountName)")
 
     password = args.password or os.environ.get("VRM_PASSWORD")
     if not password:
@@ -334,29 +443,55 @@ def run_test(args: argparse.Namespace, endpoint: VrmEndpoint, username: str, pas
         timeout=args.timeout,
     )
 
-    user_type_name = {0: "local", 1: "domain", 2: "interconnection"}.get(args.user_type, str(args.user_type))
+    user_type_name = USER_TYPE_NAMES.get(args.user_type, str(args.user_type))
+    auth_type_name = AUTH_TYPE_NAMES.get(args.auth_type, str(args.auth_type))
 
     _print_banner("1) Login")
     print(f"Script version: {__version__}")
     print(f"VRM: {endpoint.display}")
+    if endpoint.port == 8443:
+        print(f"Note: port 8443 is often the Web UI; REST API is usually {REST_API_PORT}")
     print(f"TLS verify: {'on' if args.verify_ssl else 'off (self-signed OK)'}")
-    print(f"User: {username}  (userType={args.user_type}/{user_type_name}, apiVersion={args.api_version})")
+    print(
+        f"User: {username}  "
+        f"(userType={args.user_type}/{user_type_name}, "
+        f"authType={args.auth_type}/{auth_type_name}, "
+        f"apiVersion={args.api_version})"
+    )
 
-    login = client.login(
+    login = client.login_with_fallback(
         username,
         password,
         user_type=args.user_type,
+        auth_type=args.auth_type,
         encrypt_algorithm=args.encrypt_algorithm,
+        diagnose=args.diagnose,
+        verbose=args.verbose,
     )
 
     if not login.ok:
         print("LOGIN: FAILED")
         print(f"  HTTP status: {login.http_status}")
+        print(f"  Error code: {login.error_code}")
         print(f"  Error: {login.error}")
+        if login.attempted:
+            print("  Attempts:")
+            for a in login.attempted:
+                print(f"    - {a}")
+        if login.error_code == "10000002" or login.http_status == 401:
+            print()
+            print(HINT_10000002)
+            if endpoint.port == 8443:
+                alt = f"{endpoint.scheme}://{endpoint.host}:{REST_API_PORT}"
+                print(f"\nSuggested retry URL: {alt}")
         return 1
 
     print("LOGIN: SUCCESS")
     print(f"  HTTP status: {login.http_status}")
+    print(
+        f"  Auth used: userType={login.user_type}/{USER_TYPE_NAMES.get(login.user_type or -1, '?')} "
+        f"authType={login.auth_type}/{AUTH_TYPE_NAMES.get(login.auth_type or -1, '?')}"
+    )
     if login.token and len(login.token) > 28:
         print(f"  Token: {login.token[:16]}...{login.token[-8:]}")
     else:
@@ -483,12 +618,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="X-Auth-UserType: 0=local, 1=domain (default), 2=interconnection",
     )
     p.add_argument(
+        "--auth-type",
+        type=int,
+        default=int(os.environ.get("VRM_AUTH_TYPE", str(DEFAULT_AUTH_TYPE))),
+        help="X-Auth-AuthType: 0=local auth, 1=cascading domain auth (default)",
+    )
+    p.add_argument(
         "--encrypt-algorithm",
         type=int,
         default=0,
         choices=(0, 1),
         help="X-ENCRYPT-ALGORITHM: 0=SHA-256 (default), 1=plaintext",
     )
+    p.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="On login failure, retry common userType/authType combinations",
+    )
+    p.add_argument("--verbose", action="store_true", help="Print login request details (password redacted)")
     p.add_argument("--include-templates", action="store_true", help="Also list templates")
     p.add_argument("--detail", type=int, default=0, help="VM list detail level (default 0)")
     p.add_argument(
