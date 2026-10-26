@@ -2,7 +2,7 @@
 """
 FusionCompute VRM REST API smoke test.
 
-Version: 1.2.1
+Version: 1.3.0
 
 Tests:
   1) Login (POST /service/session) — reports success/failure
@@ -16,14 +16,16 @@ Port note (Huawei VRM APIs doc):
   - Web UI login page: typically TCP 8443
   If login returns HTTP 401 / errorCode 10000002 against :8443, retry with :7443.
 
-Auth defaults:
-  - X-Auth-UserType=1 (domain user)
-  - X-Auth-AuthType=0 (local authentication against VRM-configured domain)
-    Use AuthType=1 only when cascading domain controller is configured.
+Auth notes:
+  - REST doc default X-Auth-UserType is 2 (interconnection / 接口对接用户).
+  - Web UI domain/local accounts often work in the browser but fail REST with 10100103
+    unless userType/authType/password encoding match, or an interconnection user is used.
+  - Domain without cascading DC: userType=1, authType=0.
 TLS verify is off (self-signed certificates).
 
 Example (interactive prompts for URL, username, password):
   python3 vrm_api_test.py
+  python3 vrm_api_test.py --diagnose
   python3 vrm_api_test.py --version
 """
 
@@ -34,6 +36,7 @@ import getpass
 import hashlib
 import json
 import os
+import re
 import ssl
 import sys
 import urllib.error
@@ -43,13 +46,13 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 __api_doc__ = "FusionCompute 8.8.1 VRM APIs"
 
 DEFAULT_PORT = 8443
 REST_API_PORT = 7443  # documented VRM REST port
 DEFAULT_API_VERSION = "8.1"
-DEFAULT_USER_TYPE = 1  # domain user
+DEFAULT_USER_TYPE = 1  # domain user (prompt can override)
 DEFAULT_AUTH_TYPE = 0  # local auth (VRM domain LDAP) — not cascading
 PAGE_SIZE = 100
 TOKEN_HEADER = "X-Auth-Token"
@@ -77,9 +80,36 @@ Hints for errorCode 10100119
   Your VRM has no cascading domain controller. Do NOT use AuthType=1.
   Use domain user + local authentication instead:
     --user-type 1 --auth-type 0
-  (This is now the script default in v1.2.1+.)
   Ensure a domain authentication server is configured under VRM user/domain settings,
   and your account is synced/assigned a role.
+""".strip()
+
+# Doc: 400 / 10100103 = username or password incorrect
+HINT_10100103 = """
+Hints for errorCode 10100103
+("username or password is incorrect") — even when Web UI login works:
+
+  Web UI (:8443) and REST API are different auth paths.
+
+  1) Preferred for REST: create an "接口对接用户" / Interface interconnection user
+     in FusionCompute (System Management → Permissions → Users).
+     That account cannot log in to the Web UI, but is what northbound REST expects.
+     Then run with:  --user-type 2 --auth-type 0
+     (REST doc default userType is 2 / interconnection.)
+
+  2) If you must use a domain account via REST:
+       --user-type 1 --auth-type 0
+     Username must match how the user is registered in FusionCompute
+     (often plain sAMAccountName, not DOMAIN\\\\user). Try:
+       - just the short name (user)
+       - user@domain.com
+       - DOMAIN\\\\user
+     Re-run:  python3 vrm_api_test.py --diagnose --verbose
+
+  3) Password must be SHA-256 hex of the plaintext (X-ENCRYPT-ALGORITHM=0),
+     or plaintext with --encrypt-algorithm 1. --diagnose tries both / hex case.
+
+  4) Confirm REST URL uses port 7443 (API), not only 8443 (Web UI).
 """.strip()
 
 
@@ -211,11 +241,35 @@ class VrmClient:
             raise ConnectionError(f"Cannot reach VRM at {url}: {e.reason}") from e
 
     @staticmethod
-    def hash_password(password: str, algorithm: int = 0) -> str:
+    def hash_password(password: str, algorithm: int = 0, *, uppercase_hex: bool = False) -> str:
         """X-ENCRYPT-ALGORITHM: 0 = SHA-256 hex (default), 1 = plaintext."""
         if algorithm == 1:
             return password
-        return hashlib.sha256(password.encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        return digest.upper() if uppercase_hex else digest
+
+    @staticmethod
+    def username_variants(username: str) -> list[str]:
+        """Common FC username forms (Web UI vs REST often differ)."""
+        raw = username.strip()
+        variants = [raw]
+        # DOMAIN\user or DOMAIN/user
+        m = re.match(r"^([^\\/@]+)[\\/](.+)$", raw)
+        if m:
+            domain, user = m.group(1), m.group(2)
+            variants.extend([user, f"{user}@{domain}", f"{domain}\\{user}"])
+        # user@domain.com
+        if "@" in raw and not m:
+            user, domain = raw.split("@", 1)
+            variants.extend([user, f"{domain}\\{user}", f"{domain.split('.')[0]}\\{user}"])
+        # de-dupe, preserve order
+        seen: set[str] = set()
+        out: list[str] = []
+        for v in variants:
+            if v and v not in seen:
+                seen.add(v)
+                out.append(v)
+        return out
 
     def login(
         self,
@@ -225,6 +279,7 @@ class VrmClient:
         user_type: int = DEFAULT_USER_TYPE,
         auth_type: int = DEFAULT_AUTH_TYPE,
         encrypt_algorithm: int = 0,
+        uppercase_hex: bool = False,
         verbose: bool = False,
     ) -> LoginResult:
         """
@@ -233,7 +288,9 @@ class VrmClient:
         user_type: 0 local, 1 domain, 2 interconnection.
         auth_type: 0 local authentication, 1 cascading domain authentication.
         """
-        hashed = self.hash_password(password, encrypt_algorithm)
+        hashed = self.hash_password(
+            password, encrypt_algorithm, uppercase_hex=uppercase_hex
+        )
         extra = {
             "X-Auth-User": username,
             "X-Auth-Key": hashed,
@@ -241,9 +298,19 @@ class VrmClient:
             "X-Auth-AuthType": str(auth_type),
             "X-ENCRYPT-ALGORITHM": str(encrypt_algorithm),
         }
+        hex_note = ""
+        if encrypt_algorithm == 0:
+            hex_note = f" sha256={'upper' if uppercase_hex else 'lower'}"
+        label = (
+            f"user={username!r} "
+            f"userType={user_type}/{USER_TYPE_NAMES.get(user_type, '?')} "
+            f"authType={auth_type}/{AUTH_TYPE_NAMES.get(auth_type, '?')} "
+            f"encrypt={encrypt_algorithm}{hex_note}"
+        )
         if verbose:
             safe = {k: ("***" if k == "X-Auth-Key" else v) for k, v in extra.items()}
             print(f"  POST {self.base}/service/session")
+            print(f"  try: {label}")
             print(f"  headers: {safe}")
 
         status, headers, body = self.request(
@@ -268,12 +335,6 @@ class VrmClient:
             err = str(body)
         else:
             err = f"HTTP {status}"
-
-        label = (
-            f"userType={user_type}/{USER_TYPE_NAMES.get(user_type, '?')} "
-            f"authType={auth_type}/{AUTH_TYPE_NAMES.get(auth_type, '?')} "
-            f"encrypt={encrypt_algorithm}"
-        )
 
         if status == 200 and token:
             self.token = token
@@ -314,42 +375,64 @@ class VrmClient:
         diagnose: bool = False,
         verbose: bool = False,
     ) -> LoginResult:
-        """Try primary auth settings; auto-fix cascade→local; optionally probe more."""
-        attempts: list[tuple[int, int, int]] = [(user_type, auth_type, encrypt_algorithm)]
-        # If cascading domain was requested, always also try local auth type for domain users
-        # (10100119 = cascade DC not configured is common).
+        """
+        Try primary auth settings, then sensible fallbacks for 10100103/10100119.
+
+        Attempt tuple: (username, user_type, auth_type, encrypt, uppercase_hex)
+        """
+        attempts: list[tuple[str, int, int, int, bool]] = [
+            (username, user_type, auth_type, encrypt_algorithm, False)
+        ]
+
+        def add(u: str, ut: int, at: int, enc: int, upper: bool = False) -> None:
+            item = (u, ut, at, enc, upper)
+            if item not in attempts:
+                attempts.append(item)
+
+        # Cascade DC missing → retry domain + local auth
         if user_type == 1 and auth_type == 1:
-            attempts.append((1, 0, encrypt_algorithm))
+            add(username, 1, 0, encrypt_algorithm, False)
+
+        # Wrong password encoding is a common 10100103 cause — always try the other mode once
+        if encrypt_algorithm == 0:
+            add(username, user_type, auth_type if not (user_type == 1 and auth_type == 1) else 0, 0, True)
+            add(username, user_type, 0 if user_type == 1 else auth_type, 1, False)
+        else:
+            add(username, user_type, auth_type, 0, False)
+
         if diagnose:
-            for ut, at, enc in (
-                (1, 0, 0),  # domain + local auth (VRM LDAP) — usual domain case
-                (1, 1, 0),  # domain + cascading domain
-                (2, 0, 0),  # interconnection (northbound API user)
-                (0, 0, 0),  # local user
-                (1, 0, 1),  # domain + plaintext password
-            ):
-                if (ut, at, enc) not in attempts:
-                    attempts.append((ut, at, enc))
+            names = self.username_variants(username)
+            for name in names:
+                # Domain via VRM LDAP
+                add(name, 1, 0, 0, False)
+                add(name, 1, 0, 0, True)
+                add(name, 1, 0, 1, False)
+                # Interconnection (REST default in Huawei docs)
+                add(name, 2, 0, 0, False)
+                add(name, 2, 0, 1, False)
+                # Local
+                add(name, 0, 0, 0, False)
+                add(name, 0, 0, 1, False)
 
         attempted_labels: list[str] = []
         last = LoginResult(ok=False, error="no attempts")
-        for ut, at, enc in attempts:
+        for name, ut, at, enc, upper in attempts:
             last = self.login(
-                username,
+                name,
                 password,
                 user_type=ut,
                 auth_type=at,
                 encrypt_algorithm=enc,
+                uppercase_hex=upper,
                 verbose=verbose,
             )
             attempted_labels.extend(last.attempted)
             if last.ok:
                 last.attempted = attempted_labels
                 return last
-            # After cascade-not-configured, skip remaining cascade attempts unless diagnosing
-            if last.error_code == "10100119" and not diagnose:
-                # Prefer immediate local-auth retry if not already queued next
-                continue
+            # Stop early on lockouts
+            if last.error_code in {"10100113", "10100116", "10100117", "10100118"}:
+                break
 
         last.attempted = attempted_labels
         return last
@@ -432,7 +515,11 @@ def prompt_credentials(args: argparse.Namespace) -> tuple[VrmEndpoint, str, str]
     print(f"API reference: {__api_doc__}")
     print(
         f"Defaults: port {DEFAULT_PORT} (REST often {REST_API_PORT}), "
-        "domain user + authType=0 (local), self-signed TLS accepted"
+        "self-signed TLS accepted"
+    )
+    print(
+        "User types: 0=local, 1=domain (Web UI domain account), "
+        "2=interconnection/接口对接 (recommended for REST)"
     )
     print()
 
@@ -444,13 +531,29 @@ def prompt_credentials(args: argparse.Namespace) -> tuple[VrmEndpoint, str, str]
         )
     endpoint = parse_vrm_url(raw_url, default_port=args.port)
 
+    # Allow interactive override of user type when not forced via CLI/env specialty
+    if "VRM_USER_TYPE" not in os.environ and "--user-type" not in sys.argv:
+        ut_raw = _prompt(
+            "User type (0=local, 1=domain, 2=interconnection)",
+            default=str(args.user_type),
+        )
+        try:
+            args.user_type = int(ut_raw)
+        except ValueError:
+            raise SystemExit(f"Invalid user type: {ut_raw!r}")
+
     username = args.user or os.environ.get("VRM_USER")
     if not username:
-        username = _prompt("Domain username (DOMAIN\\user or user@domain or sAMAccountName)")
+        if args.user_type == 2:
+            username = _prompt("Interconnection username (接口对接用户)")
+        elif args.user_type == 1:
+            username = _prompt("Domain username (prefer short name as in FC user list)")
+        else:
+            username = _prompt("Local username")
 
     password = args.password or os.environ.get("VRM_PASSWORD")
     if not password:
-        password = getpass.getpass("Domain password: ")
+        password = getpass.getpass("Password: ")
         if not password:
             raise SystemExit("Password is required")
 
@@ -500,7 +603,10 @@ def run_test(args: argparse.Namespace, endpoint: VrmEndpoint, username: str, pas
             print("  Attempts:")
             for a in login.attempted:
                 print(f"    - {a}")
-        if login.error_code == "10100119":
+        if login.error_code == "10100103":
+            print()
+            print(HINT_10100103)
+        elif login.error_code == "10100119":
             print()
             print(HINT_10100119)
         elif login.error_code == "10000002" or login.http_status == 401:
