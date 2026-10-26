@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""
+FusionCompute VRM REST API smoke test.
+
+Version: 1.1.0
+
+Tests:
+  1) Login (POST /service/session) — reports success/failure
+  2) List sites (GET /service/sites)
+  3) List all VMs across sites (GET /service/sites/{id}/vms) with pagination
+
+Based on FusionCompute 8.8.1 VRM APIs (HTTPS, base path /service).
+Default API port: 8443. Auth defaults to domain user. TLS verify off
+(self-signed certificates).
+
+Example (interactive prompts for URL, username, password):
+  python3 vrm_api_test.py
+  python3 vrm_api_test.py --version
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import hashlib
+import json
+import os
+import ssl
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urlparse
+
+__version__ = "1.1.0"
+__api_doc__ = "FusionCompute 8.8.1 VRM APIs"
+
+DEFAULT_PORT = 8443
+DEFAULT_API_VERSION = "8.1"
+DEFAULT_USER_TYPE = 1  # domain user
+PAGE_SIZE = 100
+TOKEN_HEADER = "X-Auth-Token"
+
+
+@dataclass
+class LoginResult:
+    ok: bool
+    token: str | None = None
+    body: dict[str, Any] | None = None
+    error: str | None = None
+    http_status: int | None = None
+
+
+@dataclass
+class VrmEndpoint:
+    host: str
+    port: int
+    scheme: str = "https"
+
+    @property
+    def base(self) -> str:
+        return f"{self.scheme}://{self.host}:{self.port}"
+
+    @property
+    def display(self) -> str:
+        return self.base
+
+
+def parse_vrm_url(raw: str, default_port: int = DEFAULT_PORT) -> VrmEndpoint:
+    """
+    Accepts:
+      https://vrm.example.com:8443
+      https://vrm.example.com
+      vrm.example.com:8443
+      vrm.example.com
+      192.168.1.100
+    """
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("URL is empty")
+
+    if "://" not in text:
+        text = "https://" + text
+
+    parsed = urlparse(text)
+    if parsed.scheme not in ("https", "http"):
+        raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r} (use https)")
+    if not parsed.hostname:
+        raise ValueError(f"Could not parse host from URL: {raw!r}")
+
+    port = parsed.port or default_port
+    return VrmEndpoint(host=parsed.hostname, port=port, scheme=parsed.scheme)
+
+
+class VrmClient:
+    def __init__(
+        self,
+        endpoint: VrmEndpoint,
+        api_version: str = DEFAULT_API_VERSION,
+        verify_ssl: bool = False,
+        timeout: float = 30.0,
+    ) -> None:
+        self.endpoint = endpoint
+        self.base = endpoint.base
+        self.api_version = api_version
+        self.timeout = timeout
+        self.token: str | None = None
+        self._ssl_ctx = ssl.create_default_context()
+        # Self-signed VRM certificates: skip verification unless explicitly enabled
+        if not verify_ssl:
+            self._ssl_ctx.check_hostname = False
+            self._ssl_ctx.verify_mode = ssl.CERT_NONE
+
+    def _headers(self, extra: dict[str, str] | None = None, auth: bool = True) -> dict[str, str]:
+        headers = {
+            "Accept": f"application/json;version={self.api_version};charset=UTF-8",
+            "Content-Type": "application/json;charset=UTF-8",
+            "Accept-Language": "en_US",
+        }
+        if auth and self.token:
+            headers[TOKEN_HEADER] = self.token
+        if extra:
+            headers.update(extra)
+        return headers
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+        body: dict[str, Any] | None = None,
+        auth: bool = True,
+    ) -> tuple[int, dict[str, str], Any]:
+        url = self.base + path
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers=self._headers(headers, auth=auth),
+            method=method.upper(),
+        )
+        try:
+            with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=self.timeout) as resp:
+                raw = resp.read()
+                resp_headers = {k: v for k, v in resp.headers.items()}
+                payload: Any = None
+                if raw:
+                    try:
+                        payload = json.loads(raw.decode("utf-8"))
+                    except json.JSONDecodeError:
+                        payload = raw.decode("utf-8", errors="replace")
+                return resp.status, resp_headers, payload
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            payload = None
+            if raw:
+                try:
+                    payload = json.loads(raw.decode("utf-8"))
+                except json.JSONDecodeError:
+                    payload = raw.decode("utf-8", errors="replace")
+            headers_out = {k: v for k, v in e.headers.items()} if e.headers else {}
+            return e.code, headers_out, payload
+        except urllib.error.URLError as e:
+            raise ConnectionError(f"Cannot reach VRM at {url}: {e.reason}") from e
+
+    @staticmethod
+    def hash_password(password: str, algorithm: int = 0) -> str:
+        """X-ENCRYPT-ALGORITHM: 0 = SHA-256 hex (default), 1 = plaintext."""
+        if algorithm == 1:
+            return password
+        return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+    def login(
+        self,
+        username: str,
+        password: str,
+        *,
+        user_type: int = DEFAULT_USER_TYPE,
+        encrypt_algorithm: int = 0,
+    ) -> LoginResult:
+        """
+        POST /service/session
+
+        user_type: 0 local, 1 domain, 2 interconnection.
+        """
+        hashed = self.hash_password(password, encrypt_algorithm)
+        status, headers, body = self.request(
+            "POST",
+            "/service/session",
+            headers={
+                "X-Auth-User": username,
+                "X-Auth-Key": hashed,
+                "X-Auth-UserType": str(user_type),
+                "X-ENCRYPT-ALGORITHM": str(encrypt_algorithm),
+            },
+            auth=False,
+        )
+
+        token = None
+        for key, value in headers.items():
+            if key.lower() == TOKEN_HEADER.lower():
+                token = value
+                break
+
+        if status == 200 and token:
+            self.token = token
+            return LoginResult(
+                ok=True,
+                token=token,
+                body=body if isinstance(body, dict) else None,
+                http_status=status,
+            )
+
+        err = None
+        if isinstance(body, dict):
+            err = body.get("errorDes") or body.get("errorCode") or json.dumps(body)
+        else:
+            err = str(body) if body is not None else f"HTTP {status}"
+        return LoginResult(
+            ok=False,
+            body=body if isinstance(body, dict) else None,
+            error=err,
+            http_status=status,
+        )
+
+    def logout(self) -> bool:
+        if not self.token:
+            return True
+        status, _, _ = self.request("DELETE", "/service/session")
+        self.token = None
+        return status == 200
+
+    def list_sites(self) -> list[dict[str, Any]]:
+        status, _, body = self.request("GET", "/service/sites")
+        if status != 200:
+            raise RuntimeError(f"List sites failed (HTTP {status}): {body}")
+        if not isinstance(body, dict):
+            raise RuntimeError(f"Unexpected sites response: {body}")
+        return body.get("sites") or []
+
+    def list_vms_for_site(
+        self,
+        site_uri: str,
+        *,
+        include_templates: bool = False,
+        detail: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Paginate GET {site_uri}/vms until all VMs are collected."""
+        all_vms: list[dict[str, Any]] = []
+        offset = 0
+        total: int | None = None
+
+        while True:
+            query = urllib.parse.urlencode(
+                {
+                    "limit": PAGE_SIZE,
+                    "offset": offset,
+                    "isTemplate": "true" if include_templates else "false",
+                    "detail": detail,
+                }
+            )
+            path = f"{site_uri}/vms?{query}"
+            status, _, body = self.request("GET", path)
+            if status != 200:
+                raise RuntimeError(f"List VMs failed for {site_uri} (HTTP {status}): {body}")
+            if not isinstance(body, dict):
+                raise RuntimeError(f"Unexpected VMs response: {body}")
+
+            batch = body.get("vms") or []
+            total = int(body.get("total", len(batch)))
+            all_vms.extend(batch)
+
+            offset += len(batch)
+            if not batch or offset >= total:
+                break
+
+        return all_vms
+
+
+def _print_banner(title: str) -> None:
+    print()
+    print("=" * 60)
+    print(title)
+    print("=" * 60)
+
+
+def _prompt(label: str, default: str | None = None) -> str:
+    if default:
+        value = input(f"{label} [{default}]: ").strip()
+        return value or default
+    while True:
+        value = input(f"{label}: ").strip()
+        if value:
+            return value
+        print("  (required)")
+
+
+def prompt_credentials(args: argparse.Namespace) -> tuple[VrmEndpoint, str, str]:
+    """Prompt for VRM URL, domain username, and password when not provided."""
+    print(f"FusionCompute VRM API test  v{__version__}")
+    print(f"API reference: {__api_doc__}")
+    print(f"Defaults: port {DEFAULT_PORT}, domain user, self-signed TLS accepted")
+    print()
+
+    raw_url = args.url or os.environ.get("VRM_URL")
+    if not raw_url:
+        raw_url = _prompt(
+            "VRM URL (e.g. https://vrm.example.com:8443)",
+            default=None,
+        )
+    endpoint = parse_vrm_url(raw_url, default_port=args.port)
+
+    username = args.user or os.environ.get("VRM_USER")
+    if not username:
+        username = _prompt("Domain username")
+
+    password = args.password or os.environ.get("VRM_PASSWORD")
+    if not password:
+        password = getpass.getpass("Domain password: ")
+        if not password:
+            raise SystemExit("Password is required")
+
+    return endpoint, username, password
+
+
+def run_test(args: argparse.Namespace, endpoint: VrmEndpoint, username: str, password: str) -> int:
+    client = VrmClient(
+        endpoint=endpoint,
+        api_version=args.api_version,
+        verify_ssl=args.verify_ssl,
+        timeout=args.timeout,
+    )
+
+    user_type_name = {0: "local", 1: "domain", 2: "interconnection"}.get(args.user_type, str(args.user_type))
+
+    _print_banner("1) Login")
+    print(f"Script version: {__version__}")
+    print(f"VRM: {endpoint.display}")
+    print(f"TLS verify: {'on' if args.verify_ssl else 'off (self-signed OK)'}")
+    print(f"User: {username}  (userType={args.user_type}/{user_type_name}, apiVersion={args.api_version})")
+
+    login = client.login(
+        username,
+        password,
+        user_type=args.user_type,
+        encrypt_algorithm=args.encrypt_algorithm,
+    )
+
+    if not login.ok:
+        print("LOGIN: FAILED")
+        print(f"  HTTP status: {login.http_status}")
+        print(f"  Error: {login.error}")
+        return 1
+
+    print("LOGIN: SUCCESS")
+    print(f"  HTTP status: {login.http_status}")
+    if login.token and len(login.token) > 28:
+        print(f"  Token: {login.token[:16]}...{login.token[-8:]}")
+    else:
+        print(f"  Token: {login.token}")
+    if login.body:
+        print(f"  userId: {login.body.get('userId')}")
+        print(f"  userName: {login.body.get('userName')}")
+        print(f"  roleList: {login.body.get('roleList')}")
+        print(f"  validity_ms: {login.body.get('validity')}")
+
+    exit_code = 0
+    try:
+        _print_banner("2) List sites")
+        sites = client.list_sites()
+        print(f"Sites found: {len(sites)}")
+        for site in sites:
+            print(
+                f"  - name={site.get('name')}  uri={site.get('uri')}  "
+                f"status={site.get('status')}  isSelf={site.get('isSelf')}"
+            )
+
+        if not sites:
+            print("LIST VMs: SKIPPED (no sites)")
+            exit_code = 2
+        else:
+            _print_banner("3) List all VMs")
+            grand_total = 0
+            all_vms: list[dict[str, Any]] = []
+            for site in sites:
+                site_uri = site.get("uri")
+                if not site_uri:
+                    urn = site.get("urn") or ""
+                    parts = urn.split(":")
+                    site_uri = f"/service/sites/{parts[-1]}" if parts else None
+                if not site_uri:
+                    print(f"  Skipping site without uri: {site}")
+                    continue
+
+                vms = client.list_vms_for_site(
+                    site_uri,
+                    include_templates=args.include_templates,
+                    detail=args.detail,
+                )
+                grand_total += len(vms)
+                all_vms.extend(vms)
+                print(f"\nSite {site.get('name')} ({site_uri}): {len(vms)} VM(s)")
+                for vm in vms:
+                    print(
+                        f"  - {vm.get('name')}  status={vm.get('status')}  "
+                        f"urn={vm.get('urn')}  location={vm.get('locationName') or vm.get('location')}"
+                    )
+
+            print()
+            print(f"LIST VMs: SUCCESS — total {grand_total} VM(s)")
+            if args.json_out:
+                payload = {
+                    "script_version": __version__,
+                    "login": True,
+                    "vrm": endpoint.display,
+                    "sites": sites,
+                    "vm_count": grand_total,
+                    "vms": [
+                        {
+                            "name": vm.get("name"),
+                            "status": vm.get("status"),
+                            "urn": vm.get("urn"),
+                            "uri": vm.get("uri"),
+                        }
+                        for vm in all_vms
+                    ],
+                }
+                with open(args.json_out, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2)
+                print(f"Wrote summary: {args.json_out}")
+
+    except (ConnectionError, RuntimeError) as e:
+        print(f"ERROR after login: {e}")
+        exit_code = 3
+    finally:
+        _print_banner("4) Logout")
+        if client.logout():
+            print("LOGOUT: SUCCESS")
+        else:
+            print("LOGOUT: FAILED (ignored)")
+
+    return exit_code
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Test FusionCompute VRM login and VM list APIs (domain user, self-signed TLS)",
+    )
+    p.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__} ({__api_doc__})",
+    )
+    p.add_argument(
+        "--url",
+        default=None,
+        help="VRM base URL, e.g. https://vrm.example.com:8443 (prompted if omitted)",
+    )
+    p.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("VRM_PORT", DEFAULT_PORT)),
+        help=f"Default port when URL has none (default {DEFAULT_PORT})",
+    )
+    p.add_argument("--user", default=None, help="Domain username (prompted if omitted)")
+    p.add_argument(
+        "--password",
+        default=None,
+        help="Password (prompted if omitted; prefer prompt/env over CLI)",
+    )
+    p.add_argument(
+        "--api-version",
+        default=os.environ.get("VRM_API_VERSION", DEFAULT_API_VERSION),
+        help="Accept version= (default 8.1 for FC 8.1+)",
+    )
+    p.add_argument(
+        "--user-type",
+        type=int,
+        default=int(os.environ.get("VRM_USER_TYPE", str(DEFAULT_USER_TYPE))),
+        help="X-Auth-UserType: 0=local, 1=domain (default), 2=interconnection",
+    )
+    p.add_argument(
+        "--encrypt-algorithm",
+        type=int,
+        default=0,
+        choices=(0, 1),
+        help="X-ENCRYPT-ALGORITHM: 0=SHA-256 (default), 1=plaintext",
+    )
+    p.add_argument("--include-templates", action="store_true", help="Also list templates")
+    p.add_argument("--detail", type=int, default=0, help="VM list detail level (default 0)")
+    p.add_argument(
+        "--verify-ssl",
+        action="store_true",
+        help="Verify TLS certificates (default: off for self-signed VRM certs)",
+    )
+    p.add_argument("--timeout", type=float, default=30.0)
+    p.add_argument("--json-out", help="Optional path to write a JSON summary")
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        endpoint, username, password = prompt_credentials(args)
+        return run_test(args, endpoint, username, password)
+    except ValueError as e:
+        print(f"Invalid URL: {e}", file=sys.stderr)
+        return 2
+    except ConnectionError as e:
+        print(f"LOGIN: FAILED (connection)\n  {e}")
+        return 1
+    except KeyboardInterrupt:
+        print("\nInterrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
