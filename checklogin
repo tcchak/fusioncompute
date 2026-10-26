@@ -17,7 +17,7 @@ Port note (Huawei VRM APIs doc):
   If login returns HTTP 401 / errorCode 10000002 against :8443, retry with :7443.
 
 Auth notes:
-  - REST doc default X-Auth-UserType is 2 (interconnection / 接口对接用户).
+  - REST doc default X-Auth-UserType is 2 (interconnection / interface account).
   - Web UI domain/local accounts often work in the browser but fail REST with 10100103
     unless userType/authType/password encoding match, or an interconnection user is used.
   - Domain without cascading DC: userType=1, authType=0.
@@ -91,8 +91,8 @@ Hints for errorCode 10100103
 
   Web UI (:8443) and REST API are different auth paths.
 
-  1) Preferred for REST: create an "接口对接用户" / Interface interconnection user
-     in FusionCompute (System Management → Permissions → Users).
+  1) Preferred for REST: create an Interface interconnection user
+     in FusionCompute (System Management -> Permissions -> Users).
      That account cannot log in to the Web UI, but is what northbound REST expects.
      Then run with:  --user-type 2 --auth-type 0
      (REST doc default userType is 2 / interconnection.)
@@ -519,7 +519,7 @@ def prompt_credentials(args: argparse.Namespace) -> tuple[VrmEndpoint, str, str]
     )
     print(
         "User types: 0=local, 1=domain (Web UI domain account), "
-        "2=interconnection/接口对接 (recommended for REST)"
+        "2=interconnection/interface account (recommended for REST)"
     )
     print()
 
@@ -545,7 +545,7 @@ def prompt_credentials(args: argparse.Namespace) -> tuple[VrmEndpoint, str, str]
     username = args.user or os.environ.get("VRM_USER")
     if not username:
         if args.user_type == 2:
-            username = _prompt("Interconnection username (接口对接用户)")
+            username = _prompt("Interconnection username (interface account)")
         elif args.user_type == 1:
             username = _prompt("Domain username (prefer short name as in FC user list)")
         else:
